@@ -23,7 +23,7 @@ ParseCommandLine(
 // Some options are currently compile time constants.
 //
 
-#define DEFAULT_BLOCKSIZE 4096
+#define DEFAULT_BLOCKSIZE 65536
 
 //
 // ----------------------------------------------------------- Queue Management
@@ -37,6 +37,8 @@ typedef struct _QUEUE_ENTRY {
 typedef struct _QUEUE_HEAD {
     QUEUE_ENTRY Sentinel;
     pthread_mutex_t Mutex;
+    pthread_cond_t NotEmpty;
+    int Running;
 } QUEUE_HEAD;
 
 void
@@ -56,6 +58,11 @@ Dequeue(
     );
 
 void
+ShutdownQueue(
+    QUEUE_HEAD * QueueHead
+    );
+
+void
 PrintQueue(
     QUEUE_HEAD * QueueHead
     );
@@ -70,4 +77,35 @@ typedef struct _DESCRIPTOR {
     size_t Length;
     char * Buffer;
 } DESCRIPTOR;
+
+int
+ReadBlock(
+    FILE * Stream,
+    size_t BlockLength,
+    DESCRIPTOR ** Descriptor
+    );
+
+int
+WriteDescriptor(
+    DESCRIPTOR* Descriptor
+    );
+
+//
+// ----------------------------------------------------------------- Encryption 
+//
+
+typedef struct _WORKER_CONTEXT {
+    long unused;
+} WORKER_CONTEXT;
+
+void
+EncryptDescriptor(
+    DESCRIPTOR * Descriptor,
+    char * Key,
+    size_t KeyLength
+    );
+
+void *EncryptionWorker(
+    void * Context
+    );
 
