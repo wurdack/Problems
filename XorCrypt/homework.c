@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <pthread.h>
 #include <assert.h>
@@ -7,7 +8,7 @@
 #include "homework.h"
 
 struct {
-    char * Key;
+    byte * Key;
     size_t KeyLength;
     pthread_mutex_t ReadLock;
     size_t ReadOffset;
@@ -75,6 +76,8 @@ Return Value:
         
         WorkerContext.InputStream = stdin;
         WorkerContext.OutputStream = stdout;
+        WorkerContext.Key = Globals.Key;
+        WorkerContext.KeyLength = Globals.KeyLength;
         WorkerContext.Options = &Options;
         
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
@@ -114,7 +117,7 @@ Return Value:
 int
 ReadBlock(
     FILE * Stream,
-    char * Buffer,
+    byte * Buffer,
     size_t BufferLength,
     size_t * Offset,
     size_t * BytesRead
@@ -145,7 +148,7 @@ ReadBlock(
 int
 WriteBlock(
     FILE * Stream,
-    char * Buffer,
+    byte * Buffer,
     size_t BufferLength,
     size_t Offset
     )
@@ -253,14 +256,14 @@ ParseCommandLine(
 int
 ReadKey(
     char const * FileName,
-    char ** Key,
+    byte ** Key,
     size_t * KeyLength
     )
 {
     FILE * File;
     struct stat FileStats;
     int Result;
-    char * KeyMemory;
+    byte * KeyMemory;
     
     Result = stat(FileName, &FileStats);
     if (Result != 0) {
@@ -297,6 +300,162 @@ ReadKey(
     return 0;
 }
 
+void
+IterateKey(
+    byte * Key,
+    size_t KeyLength,
+    int Iteration
+    )
+{
+    int Index;
+    int Shift;
+    
+    Shift = Iteration % 8;
+    for (Index = 0; Index < KeyLength; ++Index) {
+        //
+        // Left rotate this byte.
+        //
+        
+        Key[Index] = (Key[Index] << Shift) | (Key[Index] >> (8 - Shift));
+        
+        //
+        // Add the Index.
+        //
+        
+        Key[Index] += Iteration & 0xff;
+    }
+}
+
+byte *
+CreateBlockKey(
+    byte const * Key,
+    size_t KeyLength,
+    size_t BlockOffset
+    )
+    
+/*++
+
+Description:
+
+    This routine calculates an appropriate initial key for a given file
+    offset.
+    
+Parameters:
+
+    Key - Supplies a pointer the key material.
+    
+    KeyLength - Supplies the length of the key material.
+    
+    BlockOffset - Supplies the offset of the block requiring a new key.
+       
+Return Value:
+
+    Returns zero (0) on success.
+    
+--*/
+
+{
+
+    int Index;
+    int KeyIndex;
+    int KeyOffset; 
+    byte * KeyOut;
+    byte * NthKey;
+    int SubIndex;
+
+    KeyOut = malloc(KeyLength * 2);
+    if (KeyOut != NULL) {
+        NthKey = KeyOut + KeyLength;
+        
+        // 
+        // Find the Index of the key that overlaps the beginning of this block.
+        // 
+        
+        KeyIndex = BlockOffset / KeyLength;
+
+        //
+        // Calculate the Nth key
+        //
+        
+        memcpy(NthKey, Key, KeyLength);
+        IterateKey(NthKey, KeyLength, KeyIndex);
+            
+        // 
+        // Find the offset into the NthKey to start the new key.
+        //
+        
+        KeyOffset = BlockOffset % KeyLength;
+        
+        //
+        // Copy the end bytes of the Nth key to the start of the new key.
+        //
+        
+        for (Index = 0; Index < KeyLength - KeyOffset; ++Index) {
+            KeyOut[Index] = NthKey[Index + KeyOffset];
+        }
+        
+        //
+        // Copy the beginning bytes of the (N+1)the key to the end of the new
+        // key.
+        //
+        
+        IterateKey(NthKey, KeyLength, 1);
+        for (; Index < KeyLength; ++Index) {
+            KeyOut[Index] = NthKey[Index - KeyOffset];
+        }
+    }
+    
+    return KeyOut;
+}
+
+void
+Encrypt(
+    byte * Block,
+    size_t BlockLength,
+    byte * Key,
+    size_t KeyLength
+    )
+    
+/*++
+    
+Description:
+
+    This routine encrypts a block of memory with a given key.
+    
+Parameters:
+
+    Block - Supplies the block of memory to encrypt.
+    
+    BlockLength - Supplies the length of the block of memory.
+    
+    Key - Supplies the key material with which the block is encrypted. The key
+        material is destroyed by this operation.
+        
+    KeyLength - Supplies the length of the key.
+    
+Return Value:
+
+    None.
+
+--*/
+
+{
+    int Index;
+    int KeyIndex;
+    
+    for (KeyIndex = 0, Index = 0;
+         Index < BlockLength; 
+         ++Index, ++KeyIndex) {
+        
+        if (KeyIndex == KeyLength) {
+            KeyIndex = 0;
+            IterateKey(Key, KeyLength, 1);
+        }
+        
+        Block[Index] = Block[Index] ^ Key[KeyIndex];
+    }
+}
+
 //
 // -------------------------------------------------------------- Worker Thread
 //
@@ -306,8 +465,9 @@ WorkerThreadRoutine(
     void * Context
     )
 {
-    char * Buffer;
+    byte * Buffer;
     size_t BytesRead;
+    byte * Key;
     size_t Offset;
     int Result;
     WORKER_CONTEXT * WorkerContext;
@@ -316,6 +476,11 @@ WorkerThreadRoutine(
     Buffer = malloc(WorkerContext->Options->BlockSize);
     
     for (;;) {
+    
+        //
+        // Read a block from the stream.
+        //
+        
         Result = ReadBlock(WorkerContext->InputStream,
                            Buffer,
                            WorkerContext->Options->BlockSize,
@@ -330,10 +495,28 @@ WorkerThreadRoutine(
         if (Result == 1) {
             break;
         }
+
+        assert(BytesRead > 0); // rwurdack_todo -- handle this.
         
-        // encrypt here
+        //
+        // Calculate the key appropriate to this block.
+        //
+         
+        Key = CreateBlockKey(WorkerContext->Key,
+                             WorkerContext->KeyLength,
+                             Offset);
+
+        if (Key == NULL) {
+            fprintf(stderr, "Allocation failure in worker thread\n");
+            exit(2);       
+        }
         
-        assert(BytesRead > 0);
+        Encrypt(Buffer, BytesRead, Key, WorkerContext->KeyLength);
+        
+        //
+        // Write out the encrypted block.
+        //
+        
         Result = WriteBlock(WorkerContext->OutputStream,
                             Buffer,
                             BytesRead,

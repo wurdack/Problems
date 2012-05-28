@@ -2,6 +2,8 @@
     Homework.h
 */
 
+typedef unsigned char byte;
+
 //
 // ------------------------------------------------------------ Program Options
 //
@@ -32,7 +34,7 @@ ParseCommandLine(
 int
 ReadBlock(
     FILE * Stream,
-    char * Buffer,
+    byte * Buffer,
     size_t BufferLength,
     size_t * Offset,
     size_t * BytesRead
@@ -41,7 +43,7 @@ ReadBlock(
 int
 WriteBlock(
     FILE * Stream,
-    char * Buffer,
+    byte * Buffer,
     size_t BufferLength,
     size_t Offset
     );
@@ -53,7 +55,7 @@ WriteBlock(
 int
 ReadKey(
     char const * FileName,
-    char ** Key,
+    byte ** Key,
     size_t * KeyLength
     );
 
@@ -65,6 +67,8 @@ typedef struct _WORKER_CONTEXT {
     FILE * InputStream;
     FILE * OutputStream;
     OPTIONS const * Options;
+    byte const * Key;
+    size_t KeyLength;
 } WORKER_CONTEXT;
 
 void *
