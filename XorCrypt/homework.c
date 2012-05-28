@@ -1,12 +1,20 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <assert.h>
 
 #include "homework.h"
 
-QUEUE_HEAD FreeDescriptorQueue;
-QUEUE_HEAD FlushDescriptorQueue;
+struct {
+    char * Key;
+    size_t KeyLength;
+    pthread_mutex_t ReadLock;
+    size_t ReadOffset;
+    pthread_mutex_t WriteLock;
+    pthread_cond_t WriteEvent;
+    size_t WriteOffset;
+} Globals;
 
 main(int argc, char* argv[])
 
@@ -39,71 +47,62 @@ Return Value:
 
 {
 
-    DESCRIPTOR* Descriptor;
-    size_t DescriptorSize;
     int Index;
     OPTIONS Options;
     int Result;
+    WORKER_CONTEXT WorkerContext;
     
-    pthread_t WorkerThread;
+    pthread_t * WorkerThreads;
 
     if (ParseCommandLine(argc, argv, &Options) == 0) {
 
-        //
-        // Allocate descriptors and initialize the free descriptor queue.
+        // 
+        // Read the key.
         //
 
-        InitializeQueue(&FreeDescriptorQueue);
-        InitializeQueue(&FlushDescriptorQueue);
+        Result = ReadKey(Options.KeyFileName, &Globals.Key, &Globals.KeyLength);
 
-        fprintf(stderr, " FreeQueue: %p\n", &FreeDescriptorQueue);
-        fprintf(stderr, "FlushQueue: %p\n", &FlushDescriptorQueue);
-       
-        DescriptorSize = sizeof(DESCRIPTOR) + Options.BlockSize;
-        
-        //                       V-- rwurdack_todo
-        for (Index = 0; Index < 128; ++Index) {
-            Descriptor = calloc(DescriptorSize, sizeof(char));
-            if (Descriptor == NULL) {
-                fprintf(stderr, "Descriptor allocation failure\n");
-                exit(0); // rwurdack_todo -- yes this leaks.
-            }
-            
-            Descriptor->Buffer = (char *)Descriptor + sizeof(DESCRIPTOR);
-            Enqueue(&FreeDescriptorQueue, &Descriptor->Linkage);
+        if (Result != 0) {
+            fprintf(stderr, "Failure reading key\n");
+            exit (1);
         }
         
-        //
-        // Create worker thread
-        //
-        pthread_create(&WorkerThread, NULL, EncryptionWorker, NULL);
+        WorkerThreads = calloc(Options.ThreadCount, sizeof(pthread_t));
+        if (WorkerThreads == NULL) {
+            fprintf(stderr, "Failure allocating thread pool\n");
+            exit (1);
+        }
+        
+        WorkerContext.InputStream = stdin;
+        WorkerContext.OutputStream = stdout;
+        WorkerContext.Options = &Options;
+        
+        for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
+            pthread_create(&WorkerThreads[Index],
+                           NULL, 
+                           WorkerThreadRoutine,
+                           &WorkerContext);
+        }
+        
+        WorkerThreadRoutine(&WorkerContext);
+        
+        for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
+            fprintf(stderr, "Wait for thread %d\n", Index);
+            pthread_join(WorkerThreads[Index], NULL);
+        }
+        
+        fprintf(stderr, 
+                " ReadOffset: %d\n"
+                "WriteOffset: %d\n",
+                Globals.ReadOffset,
+                Globals.WriteOffset);
         
         //
-        // Read data into descriptor ring.
+        // Clean up as necessary.
         //
-        for (;;) {
-            Result = ReadBlock(stdin, Options.BlockSize, &Descriptor);
-            if (Result == 1) {
-                fprintf(stderr, "Done reading.\n");
-                ShutdownQueue(&FlushDescriptorQueue);
-                break;
-            } else if (Result == 2) {
-                fprintf(stderr, "Unexpected read error.\n");
-                exit (1);
-            }
-            
-            Enqueue(&FlushDescriptorQueue, &Descriptor->Linkage);
-        }
+
+        free(Globals.Key);
     }
-                
-    //
-    // Wait for the worker to finish.
-    //
-    pthread_join(WorkerThread, NULL);
-    
-    //
-    // Clean up descriptor allocations (rwurdack_todo)
-    //
                         
     exit(0);
 }
@@ -115,45 +114,68 @@ Return Value:
 int
 ReadBlock(
     FILE * Stream,
-    size_t BlockLength,
-    DESCRIPTOR ** Descriptor
+    char * Buffer,
+    size_t BufferLength,
+    size_t * Offset,
+    size_t * BytesRead
     )
 {
-    size_t BytesRead;
-    DESCRIPTOR * NewDescriptor;
 
-    for (;;) {
-        NewDescriptor = (DESCRIPTOR *)Dequeue(&FreeDescriptorQueue);
-        if (NewDescriptor != NULL) {
-            break;
-        }
-    }
+    pthread_mutex_lock(&Globals.ReadLock);
 
-    BytesRead = fread(NewDescriptor->Buffer, 1, BlockLength, Stream);
-    NewDescriptor->Length = BytesRead;
-    if (BytesRead == 0) {
+    *BytesRead = fread(Buffer, 1, BufferLength, Stream);
+    *Offset = Globals.ReadOffset;
+    Globals.ReadOffset += *BytesRead;
+
+    pthread_mutex_unlock(&Globals.ReadLock);
+    
+    if (*BytesRead != BufferLength) {
         if (feof(Stream)) {
+            fprintf(stderr, "Reached eof\n");
             return 1; // rwurdack_todo - eof
         } else {
+            err(ferror(Stream), "Read Error\n");
             return 2; // rwurdack_todo - fatal
         }
     } else {
-        *Descriptor = NewDescriptor;
         return 0; // rwurdack_todo - ok
     }
 }
 
 int
-WriteDescriptor(
-    DESCRIPTOR* Descriptor
+WriteBlock(
+    FILE * Stream,
+    char * Buffer,
+    size_t BufferLength,
+    size_t Offset
     )
 {
     size_t BytesWritten;
     
-    // rwurdack_todo -- parameterize stream
-    BytesWritten = fwrite(Descriptor->Buffer, 1, Descriptor->Length, stdout);
+    pthread_mutex_lock(&Globals.WriteLock);
     
-    return !(BytesWritten == Descriptor->Length);
+    for (;;) {
+        if (Globals.WriteOffset >= Offset) {
+            assert(Globals.WriteOffset == Offset);
+            BytesWritten = fwrite(Buffer, 
+                                  1, 
+                                  BufferLength, 
+                                  Stream);
+    
+            // rwurdack_todo -- should abort
+            assert(BytesWritten == BufferLength); 
+            Globals.WriteOffset += BufferLength;
+            pthread_cond_broadcast(&Globals.WriteEvent);
+            break;
+
+        } else {
+            pthread_cond_wait(&Globals.WriteEvent, &Globals.WriteLock);
+        }
+    }
+    
+    pthread_mutex_unlock(&Globals.WriteLock);
+    
+    return 0;
 }
 
 //
@@ -228,162 +250,98 @@ ParseCommandLine(
 // ----------------------------------------------------------------- Encryption 
 //
 
-void
-EncryptDescriptor(
-    DESCRIPTOR * Descriptor,
-    char * Key,
-    size_t KeyLength
+int
+ReadKey(
+    char const * FileName,
+    char ** Key,
+    size_t * KeyLength
     )
 {
-    //
-    // for now, do nothing.
-    //
+    FILE * File;
+    struct stat FileStats;
+    int Result;
+    char * KeyMemory;
+    
+    Result = stat(FileName, &FileStats);
+    if (Result != 0) {
+        fprintf(stderr, "File stats not retrieved for %s\n", FileName);
+        return 1;
+    }
+    
+    KeyMemory = malloc(FileStats.st_size);
+    if (KeyMemory == NULL) {
+        fprintf(stderr, "Memory allocation failure for key\n");
+        return 1;
+    }
+
+    File = fopen(FileName, "rb");
+    if (File == NULL) {
+        fprintf(stderr, "Failure opening keyfile %s\n", FileName);
+        free(KeyMemory);
+        return 1;
+    }
+    
+    Result = fread(KeyMemory, 1, FileStats.st_size, File);
+    
+    if (Result != FileStats.st_size) {
+        fprintf(stderr, "Failure reading key from file %s\n", FileName);
+        free(KeyMemory);
+        fclose(File);
+        return 1;
+    }
+    
+    *Key = KeyMemory;
+    *KeyLength = FileStats.st_size;
+    fclose(File);
+    
+    return 0;
 }
 
-void *EncryptionWorker(
+//
+// -------------------------------------------------------------- Worker Thread
+//
+
+void *
+WorkerThreadRoutine(
     void * Context
     )
 {
-    DESCRIPTOR* Descriptor;
-    WORKER_CONTEXT* WorkerContext;
-    
+    char * Buffer;
+    size_t BytesRead;
+    size_t Offset;
+    int Result;
+    WORKER_CONTEXT * WorkerContext;
+
     WorkerContext = (WORKER_CONTEXT*)Context;
+    Buffer = malloc(WorkerContext->Options->BlockSize);
     
     for (;;) {
-        Descriptor = (DESCRIPTOR*)Dequeue(&FlushDescriptorQueue);
-        if (Descriptor == NULL) {
+        Result = ReadBlock(WorkerContext->InputStream,
+                           Buffer,
+                           WorkerContext->Options->BlockSize,
+                           &Offset,
+                           &BytesRead);
+                           
+        if (Result == 2) {
+            fprintf(stderr, "WorkerThreadRoutine barfed\n");
+            exit(2);
+        }
+ 
+        if (Result == 1) {
             break;
         }
         
-        // rwurdack_todo -- this has no accomodation for ordering.
-        WriteDescriptor(Descriptor);
-        Enqueue(&FreeDescriptorQueue, &Descriptor->Linkage);
-    }
-}
-
-//
-// ----------------------------------------------------------- Queue Management
-//
-
-void
-InitializeQueue(
-    QUEUE_HEAD * QueueHead
-    )
-{
-    QueueHead->Sentinel.FLink = &QueueHead->Sentinel;
-    QueueHead->Sentinel.BLink = &QueueHead->Sentinel;
-    pthread_mutex_init(&QueueHead->Mutex, NULL);
-    pthread_cond_init(&QueueHead->NotEmpty, NULL);
-    QueueHead->Running = 1;
-}
-
-void
-Enqueue(
-    QUEUE_HEAD * QueueHead,
-    QUEUE_ENTRY * Entry
-    )
-{
-    QUEUE_ENTRY * FLink;
-    QUEUE_ENTRY * BLink;
-
-    assert(QueueHead->Running != 0);
-
-    pthread_mutex_lock(&QueueHead->Mutex);
-    Entry->FLink = QueueHead->Sentinel.FLink;
-    Entry->BLink = &QueueHead->Sentinel;
-    Entry->FLink->BLink = Entry;
-    QueueHead->Sentinel.FLink = Entry;
-    pthread_cond_signal(&QueueHead->NotEmpty);
-    pthread_mutex_unlock(&QueueHead->Mutex);
-}
-
-QUEUE_ENTRY *
-Dequeue(
-    QUEUE_HEAD * QueueHead
-    )
-{
-    QUEUE_ENTRY * Entry;
-
-    Entry = NULL;
-    pthread_mutex_lock(&QueueHead->Mutex);
-
-    //
-    // Block if the queue is empty and still running.
-    //
-
-    if ((QueueHead->Sentinel.BLink == &QueueHead->Sentinel) &&
-        (QueueHead->Running == 1))
-    {
-/*
-        fprintf(stderr, 
-                "Waiting for Queue %p to fire\n"
-                "    Running: %d\n"
-                "  Sentinels: %x %x\n",
-                QueueHead,
-                QueueHead->Running,
-                QueueHead->Sentinel.FLink,
-                QueueHead->Sentinel.BLink);
-*/
-        pthread_cond_wait(&QueueHead->NotEmpty, &QueueHead->Mutex);
+        // encrypt here
+        
+        assert(BytesRead > 0);
+        Result = WriteBlock(WorkerContext->OutputStream,
+                            Buffer,
+                            BytesRead,
+                            Offset);
     }
 
-    //
-    // If there is something in the queue, return it.
-    //
-    
-    if (QueueHead->Sentinel.BLink != &QueueHead->Sentinel)
-    {
-        //
-        // Remove the first queue element.
-        //
-
-        Entry = QueueHead->Sentinel.BLink;
-        QueueHead->Sentinel.BLink = Entry->BLink;
-        Entry->BLink->FLink = &QueueHead->Sentinel;
-
-        //
-        // Clean up stale pointers.
-        //
-
-        Entry->BLink = NULL;
-        Entry->FLink = NULL;
-    }
-    
-    pthread_mutex_unlock(&QueueHead->Mutex);
-    return Entry;
-}
-
-void
-ShutdownQueue(
-    QUEUE_HEAD * QueueHead
-    )
-{
-    pthread_mutex_lock(&QueueHead->Mutex);
-
-//    fprintf(stderr, "ShutdownQueue %x\n", QueueHead);
-    
-    assert(QueueHead->Running != 0);
-    
-    // rwurdack_todo -- now we need to rename this member...
-    // rwurdack_todo -- needs to broadcast I think...
-    QueueHead->Running = 0;
-    pthread_cond_signal(&QueueHead->NotEmpty);
-    pthread_mutex_unlock(&QueueHead->Mutex);
-}
-
-void
-PrintQueue(
-    QUEUE_HEAD * QueueHead
-    )
-{
-    QUEUE_ENTRY * Entry;
-
-    printf("Head %p\n", QueueHead);
-    for (Entry = QueueHead->Sentinel.FLink; 
-         Entry != &QueueHead->Sentinel; 
-         Entry = Entry->FLink) {
-
-        printf("%p %p %p\n", Entry, Entry->FLink, Entry->BLink);
-    }
+    free(Buffer);
+        
+    return NULL;
 }
 

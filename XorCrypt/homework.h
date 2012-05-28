@@ -26,86 +26,49 @@ ParseCommandLine(
 #define DEFAULT_BLOCKSIZE 65536
 
 //
-// ----------------------------------------------------------- Queue Management
-//
-
-typedef struct _QUEUE_ENTRY {
-    struct _QUEUE_ENTRY * FLink;
-    struct _QUEUE_ENTRY * BLink;
-} QUEUE_ENTRY;
-
-typedef struct _QUEUE_HEAD {
-    QUEUE_ENTRY Sentinel;
-    pthread_mutex_t Mutex;
-    pthread_cond_t NotEmpty;
-    int Running;
-} QUEUE_HEAD;
-
-void
-InitializeQueue(
-    QUEUE_HEAD * QueueHead
-    );
-
-void
-Enqueue(
-    QUEUE_HEAD * QueueHead,
-    QUEUE_ENTRY * Entry
-    );
-
-QUEUE_ENTRY *
-Dequeue(
-    QUEUE_HEAD * QueueHead
-    );
-
-void
-ShutdownQueue(
-    QUEUE_HEAD * QueueHead
-    );
-
-void
-PrintQueue(
-    QUEUE_HEAD * QueueHead
-    );
-
-//
 // ------------------------------------------------------------------- File I/O
 //
-
-typedef struct _DESCRIPTOR {
-    struct _QUEUE_ENTRY Linkage;
-    long StreamOffset;
-    size_t Length;
-    char * Buffer;
-} DESCRIPTOR;
 
 int
 ReadBlock(
     FILE * Stream,
-    size_t BlockLength,
-    DESCRIPTOR ** Descriptor
+    char * Buffer,
+    size_t BufferLength,
+    size_t * Offset,
+    size_t * BytesRead
     );
 
 int
-WriteDescriptor(
-    DESCRIPTOR* Descriptor
+WriteBlock(
+    FILE * Stream,
+    char * Buffer,
+    size_t BufferLength,
+    size_t Offset
     );
-
+    
 //
 // ----------------------------------------------------------------- Encryption 
 //
 
-typedef struct _WORKER_CONTEXT {
-    long unused;
-} WORKER_CONTEXT;
-
-void
-EncryptDescriptor(
-    DESCRIPTOR * Descriptor,
-    char * Key,
-    size_t KeyLength
+int
+ReadKey(
+    char const * FileName,
+    char ** Key,
+    size_t * KeyLength
     );
 
-void *EncryptionWorker(
+//
+// -------------------------------------------------------------- Worker Thread
+//
+
+typedef struct _WORKER_CONTEXT {
+    FILE * InputStream;
+    FILE * OutputStream;
+    OPTIONS const * Options;
+} WORKER_CONTEXT;
+
+void *
+WorkerThreadRoutine(
     void * Context
     );
 
