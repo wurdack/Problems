@@ -1,3 +1,128 @@
+/*++
+
+Description:
+
+    This program encrypts a given stream with a given key. The algorithm is
+    as follows:
+    
+        K = K_0 = Key initial value
+        K_i = ith Key iteration
+        K_ij = jth byte of ith Key iteration
+        
+        P_k = kth byte of plain text
+        E_k = kth byte of encrypted text 
+    
+        |X| = length of X
+    
+    Iteration of keys:    
+    
+        K_i+1 <== k_i ROL 1
+    
+    Encryption of P:
+    
+        i <== 0
+        j <== 0
+        while k < |P|
+            E_k <== P_k XOR K_ij
+            k <== k+1
+            j <== j+1
+            if j = |K| 
+                i <== i+1
+                j <== 0
+         
+    This algorithm has a couple of nice properties for implementation:
+    
+      * It trivially easy to implement a single threaded version of the
+        algorithm, providing a reference for a more complicated version.
+        
+      * It is trival to demonstrate that E(E(P)) = P, providing an easy way
+        to verify an implementation against itself. 
+      
+      * The offsets of a character in P and its encrypted counterpart in E are 
+        the same. In the multithreaded implementation below, this allows a 
+        writer to always know to which file position its output needs to be
+        written.
+        
+      * The key material used to encrypt a character at a given offset can
+        be calculated in constant time.
+        
+    The implementation below divides the encryption work amongst N threads,
+    as specified on the command line. Because the problem statement didn't 
+    clearly specify whether the N threads included the main thread, the 
+    implementation creates N-1 threads (in addition to the main thread) and
+    performs work on all N threads.
+    
+    The simplified description of each thread's work is:
+    
+      * Read a block
+      * Given the offset of the block, calculate the key material with which to
+        encrypt the block.
+      * Encrypt the block.
+      * Write the block.
+    
+    IO is managed by a struct called the IO_SYNCHRONIZATION_BLOCK. This struct
+    contains the condition variables, mutices, and stream information necessary
+    to perform concurrent IO.
+    
+    Reads are synchronized by a reader mutex. A read returns the stream data and
+    its offset. The current stream offset is updated under the mutex as well.
+
+    Because key material can be easily calculated for any offset in the stream,
+    it is possible to generate a new initial key (with the same length |K|) 
+    for any given block in the stream. This new key can itself be iterated over
+    the block without changing the results of the algorithm.
+    
+    [ Block_0                   ][ Block_1                   ][...
+    [ K_0      ][ K_1      ][ K_2      ][ K_3      ][ K_4      ][ K_5      ][...
+                                 [ K'_0     ][ K'_1     ][ K'_2     ]
+    
+    In the above diagram, K' is comprised of bits of K_2 and K_3, and, once
+    calculated, suffices for encrypting Block_1 independently of all other work.
+    
+    Writes are synchronized by a writer mutex. A writer must specify the offset
+    in the stream to write to. If the current write stream offset matches the
+    requested offset, the write is satisfied immediately, and a condition 
+    variable is signaled. If the current write stream offset does not match, 
+    the write will block until the condition is signalled, test the current
+    write offset for the stream, and satisfy the write or block again as
+    appropriate.
+
+Analysis:
+
+    There are tons of obvious improvements to be made with the implementation.
+    
+    Key iteration requires memory allocations. Calculating the initial key for
+    a given block in the stream requires an allocation and one or two key 
+    iterations. This results in several memory allocations that could be moved
+    up into the main thread routine, or handled more efficiently with a look-
+    aside list (since key length is invariant during the life of the process).
+    
+    Error handling is always fatal, as there is no way to gracefully handle an
+    error and leave the encrypted stream in a useable state. At best, some
+    (|P| - n) bytes could be output, and given the triviality of the encryption
+    mechanism, these would be recoverable. Routines in the implementation 
+    will attempt to propagate errors out to the worker thread routine, but it
+    would be equally correct to simply abort() or exit() when any error 
+    condition is detected.
+    
+    Because the encryption scheme is so simple, computation isn't expected to
+    be the bottleneck for the operation. Threads spend most of their time 
+    blocked on IO as opposed to doing usefull encryption work in parallel.
+    Threads likely have a convoy pattern like this:
+    
+    T1 |----- Read -----|- E -|----- Write -----|
+    T2                  |----- Read -----|- E -||----- Write -----|
+    T3                                   |----- Read -----|- E -| |- Write ...
+    
+    If the input and output streams are on the same spindle of a filesystem,
+    it's likely Reads and Writes serialize against one another as well.
+    
+    The implementation handles encryption in fixed size chunks. It is likely
+    that tuning these chunks to some ideal size for the given filesystem would
+    affect performance. The current implementation uses a chunk of 64k.
+
+--*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,15 +132,7 @@
 
 #include "homework.h"
 
-struct {
-    byte * Key;
-    size_t KeyLength;
-    pthread_mutex_t ReadLock;
-    size_t ReadOffset;
-    pthread_mutex_t WriteLock;
-    pthread_cond_t WriteEvent;
-    size_t WriteOffset;
-} Globals;
+#if !defined(UNIT_TEST)
 
 main(int argc, char* argv[])
 
@@ -42,43 +159,99 @@ Arguments:
 
 Return Value:
 
-    None.
+    The process exits with a non-zero error code on failure, or zero if the
+    stream was successfully encrypted to end-of-file.
 
 */
 
 {
 
     int Index;
+    IO_SYNCHRONIZATION_BLOCK IoSyncBlock;
+    byte * Key;
+    size_t KeyLength;
     OPTIONS Options;
     int Result;
     WORKER_CONTEXT WorkerContext;
-    
     pthread_t * WorkerThreads;
 
-    if (ParseCommandLine(argc, argv, &Options) == 0) {
+    if (ParseCommandLine(argc, argv, &Options) != 0) {
+        exit(1);
+    }
+    
+    // 
+    // Read the key.
+    //
 
-        // 
-        // Read the key.
-        //
+    if (ReadKey(Options.KeyFileName, &Key, &KeyLength) != 0) {
+        exit (1);
+    }
 
-        Result = ReadKey(Options.KeyFileName, &Globals.Key, &Globals.KeyLength);
+#if defined(REFERENCE_IMPL)
 
-        if (Result != 0) {
-            fprintf(stderr, "Failure reading key\n");
-            exit (1);
+    //
+    // This is the trivial reference implementation. It reads one byte at a 
+    // time, XORs it with key material, and writes it out. The key is rotated 
+    // one bit once the material is exhausted.
+    //
+    
+    for (Index = 0;; ++Index) {
+        int Input;
+        
+        Input = fgetc(stdin);
+        if (Input == EOF) {
+            break;
+        }
+
+        if (Index == KeyLength) {
+            IterateKey(Key, KeyLength, 1);
+            Index = 0;
         }
         
-        WorkerThreads = calloc(Options.ThreadCount, sizeof(pthread_t));
+        assert(Input <= 0xff);
+        Input ^= Key[Index];
+        fputc(Input, stdout);
+    }
+
+#else
+    
+    //
+    // This is the multithreaded implementation. The implementation spawns
+    // N-1 threads, and runs one instance of the algorithm on the current 
+    // thread (resulting in N threads running the algorithm).
+    //
+    
+    //
+    // Initialize the IO state.
+    //
+
+    IoSyncBlock.ReadOffset = 0;                
+    IoSyncBlock.WriteOffset = 0;
+    IoSyncBlock.InputStream = stdin;
+    IoSyncBlock.OutputStream = stdout;                
+    pthread_mutex_init(&IoSyncBlock.ReadLock, NULL);
+    pthread_mutex_init(&IoSyncBlock.WriteLock, NULL);
+    pthread_cond_init(&IoSyncBlock.WriteEvent, NULL);
+
+    //
+    // All threads will get a pointer to the same context.
+    //
+    
+    WorkerContext.IoSyncBlock = &IoSyncBlock;
+    WorkerContext.Key = Key;
+    WorkerContext.KeyLength = KeyLength;
+    WorkerContext.Options = &Options;
+
+    //
+    // Create additional worker threads as necessary.
+    //
+    
+    if (Options.ThreadCount > 1) {
+        WorkerThreads = calloc(Options.ThreadCount - 1, sizeof(pthread_t));
         if (WorkerThreads == NULL) {
             fprintf(stderr, "Failure allocating thread pool\n");
-            exit (1);
+            exit(1);
         }
-        
-        WorkerContext.InputStream = stdin;
-        WorkerContext.OutputStream = stdout;
-        WorkerContext.Key = Globals.Key;
-        WorkerContext.KeyLength = Globals.KeyLength;
-        WorkerContext.Options = &Options;
         
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
             pthread_create(&WorkerThreads[Index],
@@ -86,29 +259,36 @@ Return Value:
                            WorkerThreadRoutine,
                            &WorkerContext);
         }
-        
-        WorkerThreadRoutine(&WorkerContext);
-        
+    }
+    
+    //
+    // This thread gets to work, too.
+    //
+    
+    WorkerThreadRoutine(&WorkerContext);
+    
+    //
+    // Wait for the other worker threads to complete.
+    //
+    
+    if (Options.ThreadCount > 1) {
+        free(WorkerThreads);
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
-            fprintf(stderr, "Wait for thread %d\n", Index);
             pthread_join(WorkerThreads[Index], NULL);
         }
-        
-        fprintf(stderr, 
-                " ReadOffset: %d\n"
-                "WriteOffset: %d\n",
-                Globals.ReadOffset,
-                Globals.WriteOffset);
-        
-        //
-        // Clean up as necessary.
-        //
-
-        free(Globals.Key);
     }
-                        
+
+#endif
+    
+    //
+    // Clean up as necessary.
+    //
+
+    free(Key);
     exit(0);
 }
+
+#endif
 
 //
 // ------------------------------------------------------------------- File I/O
@@ -116,28 +296,60 @@ Return Value:
 
 int
 ReadBlock(
-    FILE * Stream,
+    IO_SYNCHRONIZATION_BLOCK * IoSyncBlock,
     byte * Buffer,
     size_t BufferLength,
     size_t * Offset,
     size_t * BytesRead
     )
+    
+/*++
+
+Description:
+
+    This routine reads a block of bytes from a stream synchronously with other
+    reads. If another read is in progress, this routine will block until it 
+    completes. After reading the block, the ReadOffset in the IoSyncBlock will
+    be updated with the current offset of the input stream.
+    
+Arguments:
+
+    IoSyncBlock - Supplies a structure with the current state of the input
+        stream. The routine updates the structure as necessary on exit.
+        
+    Buffer - Supplies a pointer to the buffer that will receive the stream 
+        bytes.
+        
+    BufferLength - Supplies the length of the buffer. The routine will attempt
+        to read up to BufferLength bytes.
+        
+    Offset - Supplies a pointer to memory that receives the stream offset from 
+        which the bytes were read.
+        
+    BytesRead - Supplies a pointer to memory that receives the number of bytes
+        read from the stream.
+
+Return Value:
+
+    The routine returns 0 on success, 1 if EOF is reached, and 2 on fatal error.
+    
+--*/
+
 {
 
-    pthread_mutex_lock(&Globals.ReadLock);
+    pthread_mutex_lock(&IoSyncBlock->ReadLock);
 
-    *BytesRead = fread(Buffer, 1, BufferLength, Stream);
-    *Offset = Globals.ReadOffset;
-    Globals.ReadOffset += *BytesRead;
+    *BytesRead = fread(Buffer, 1, BufferLength, IoSyncBlock->InputStream);
+    *Offset = IoSyncBlock->ReadOffset;
+    IoSyncBlock->ReadOffset += *BytesRead;
 
-    pthread_mutex_unlock(&Globals.ReadLock);
+    pthread_mutex_unlock(&IoSyncBlock->ReadLock);
     
     if (*BytesRead != BufferLength) {
-        if (feof(Stream)) {
-            fprintf(stderr, "Reached eof\n");
+        if (feof(IoSyncBlock->InputStream)) {
             return 1; // rwurdack_todo - eof
         } else {
-            err(ferror(Stream), "Read Error\n");
+            err(ferror(IoSyncBlock->InputStream), "Error in ReadBlock.\n");
             return 2; // rwurdack_todo - fatal
         }
     } else {
@@ -147,36 +359,100 @@ ReadBlock(
 
 int
 WriteBlock(
-    FILE * Stream,
+    IO_SYNCHRONIZATION_BLOCK * IoSyncBlock,
     byte * Buffer,
     size_t BufferLength,
     size_t Offset
     )
+    
+/*++
+
+Description:
+
+    This routine writes a block of bytes to the output stream specified in the
+    supplied IoSyncBlock. If the current offset of the output stream is not 
+    aligned with the offset of the buffer, the routine will block until other
+    threads have output the bytes that precede the buffer. Accordingly, writes
+    are serialized as one would expect.
+    
+Arguments:
+
+    IoSyncBlock - Supplies the current state of the output stream.
+    
+    Buffer - Supplies a pointer to the bytes to be written.
+    
+    BufferLength - Supplies the number of bytes to be written.
+    
+    Offset - Supplies the desired offset of the buffer in the output stream.
+    
+Return Value:
+
+    Returns 0 on success.
+    
+--*/
+    
 {
     size_t BytesWritten;
     
-    pthread_mutex_lock(&Globals.WriteLock);
+    pthread_mutex_lock(&IoSyncBlock->WriteLock);
+    
+    //
+    // Repeat until the block is written.
+    //
     
     for (;;) {
-        if (Globals.WriteOffset >= Offset) {
-            assert(Globals.WriteOffset == Offset);
+    
+        //
+        // If the offset of this block matches the current write stream offset,
+        // write the block out immediately.
+        //
+        
+        if (IoSyncBlock->WriteOffset >= Offset) {
+        
+            //
+            // If the current offset somehow passed this block, then some
+            // earlier write failed. Abandon.
+            //
+                  
+            if (IoSyncBlock->WriteOffset != Offset) {
+                fprintf(stderr, "Mismatched offsets writing stream\n");
+                pthread_mutex_unlock(&IoSyncBlock->WriteLock);
+                return 1;
+            }
+            
             BytesWritten = fwrite(Buffer, 
                                   1, 
                                   BufferLength, 
-                                  Stream);
+                                  IoSyncBlock->OutputStream);
     
-            // rwurdack_todo -- should abort
-            assert(BytesWritten == BufferLength); 
-            Globals.WriteOffset += BufferLength;
-            pthread_cond_broadcast(&Globals.WriteEvent);
+            if (BytesWritten != BufferLength) {
+                fprintf(stderr, "Stream write failed\n");
+                pthread_mutex_unlock(&IoSyncBlock->WriteLock);
+                return 1;
+            }
+            
+            //
+            // Update the current write offset, and broadcast to waiters that
+            // the stream offset has been updated.
+            //
+            
+            IoSyncBlock->WriteOffset += BufferLength;
+            pthread_cond_broadcast(&IoSyncBlock->WriteEvent);
             break;
 
         } else {
-            pthread_cond_wait(&Globals.WriteEvent, &Globals.WriteLock);
+        
+            //
+            // Otherwise this write needs to wait at least one other write 
+            // earlier in the stream to complete.
+            //
+            
+            pthread_cond_wait(&IoSyncBlock->WriteEvent, 
+                              &IoSyncBlock->WriteLock);
         }
     }
     
-    pthread_mutex_unlock(&Globals.WriteLock);
+    pthread_mutex_unlock(&IoSyncBlock->WriteLock);
     
     return 0;
 }
@@ -191,7 +467,29 @@ ParseCommandLine(
     char* argv[],
     OPTIONS * Options
     )
-// return != 0 on failure
+
+/*++
+
+Description:
+
+    This routine parses the command line options, defined in the comments for
+    main().
+    
+Arguments:
+
+    argc - Supplies the count of arguments.
+    
+    argv - Supplies the array of arguments.
+    
+    Options - Supplies a pointer to a structure that receives the parsed 
+        arguments.
+        
+Return Value:
+
+    Returns zero (0) on success, or non-zero otherwise.
+    
+--*/
+
 {
 
     int Index;
@@ -232,7 +530,7 @@ ParseCommandLine(
         return 1;
     }        
     
-    if (ThreadCount == 0) {
+    if (ThreadCount <= 0) {
         fprintf(stderr, "Thread count was unspecified\n");
         return 1;
     }
@@ -259,11 +557,35 @@ ReadKey(
     byte ** Key,
     size_t * KeyLength
     )
+    
+/*++
+
+Description:
+
+    This routine reads key material from a given file.
+    
+Arguments:
+
+    FileName - Supplies the name of the file from which to read the key.
+    
+    Key - Supplies a pointer to memory that will receive a pointer to the key.
+        The returned key must be freed with free().
+        
+    KeyLength - Supplies a pointer to memory that receives the length of the 
+        key.
+        
+Return Value:
+
+    Returns zero (0) on success, non-zero on failure.
+
+--*/
+
 {
+
     FILE * File;
     struct stat FileStats;
-    int Result;
     byte * KeyMemory;
+    int Result;
     
     Result = stat(FileName, &FileStats);
     if (Result != 0) {
@@ -285,7 +607,6 @@ ReadKey(
     }
     
     Result = fread(KeyMemory, 1, FileStats.st_size, File);
-    
     if (Result != FileStats.st_size) {
         fprintf(stderr, "Failure reading key from file %s\n", FileName);
         free(KeyMemory);
@@ -293,37 +614,91 @@ ReadKey(
         return 1;
     }
     
+    fclose(File);
     *Key = KeyMemory;
     *KeyLength = FileStats.st_size;
-    fclose(File);
-    
     return 0;
 }
 
-void
+int
 IterateKey(
     byte * Key,
     size_t KeyLength,
     int Iteration
     )
+    
+/*++
+
+Description:
+
+    This routine iterates a key a given number of times. A key is iterated by
+    rotating all of its bits to the left by one bit. This routine overwrites
+    the input key.
+    
+Arguments:
+
+    Key - Supplies the key.
+    
+    KeyLength - Supplies the length of the key.
+    
+    Iteration - Supplies the number of bits to rotate the key to the left.
+    
+Return Value:
+
+    Returns zero (0) on success, non-zero on failure to allocate working memory
+    to iterate the key.
+    
+--*/
+
 {
+
     int Index;
     int Shift;
+    byte * WorkingKey;
+
+    //
+    // Allocate working space for new key.
+    //
+    
+    WorkingKey = malloc(KeyLength);
+    if (WorkingKey == NULL) {
+        fprintf(stderr, "Memory allocation failed while iterating key\n");
+        return 1;
+    }
+    
+    //
+    // Do a byte-wise rotation of the key.
+    //
+
+    Shift = Iteration / 8;
+    Shift %= KeyLength;
+    for (Index = 0; Index < KeyLength; ++Index) {
+        if (Index + Shift < KeyLength) {
+            WorkingKey[Index] = Key[Index + Shift];
+        
+        } else {
+            WorkingKey[Index] = Key[Index + Shift - KeyLength];
+        }
+    }
+    
+    //
+    // Do the bit-wise rotation of the key
+    //
     
     Shift = Iteration % 8;
     for (Index = 0; Index < KeyLength; ++Index) {
-        //
-        // Left rotate this byte.
-        //
-        
-        Key[Index] = (Key[Index] << Shift) | (Key[Index] >> (8 - Shift));
-        
-        //
-        // Add the Index.
-        //
-        
-        Key[Index] += Iteration & 0xff;
+        Key[Index] = WorkingKey[Index] << Shift;
+        if (Index + 1 < KeyLength) {
+            Key[Index] |= WorkingKey[Index + 1] >> (8 - Shift);
+           
+        } else {
+            Key[Index] |= WorkingKey[0] >> (8 - Shift);
+        }
     }
+
+    free(WorkingKey);
+    
+    return 0;
 }
 
 byte *
@@ -350,7 +725,8 @@ Parameters:
        
 Return Value:
 
-    Returns zero (0) on success.
+    Returns a newly allocated key on success, or NULL on failure. The new key
+    must be freed with free().
     
 --*/
 
@@ -378,7 +754,10 @@ Return Value:
         //
         
         memcpy(NthKey, Key, KeyLength);
-        IterateKey(NthKey, KeyLength, KeyIndex);
+        if (IterateKey(NthKey, KeyLength, KeyIndex) != 0) {
+            free(KeyOut);
+            return NULL;
+        }
             
         // 
         // Find the offset into the NthKey to start the new key.
@@ -399,7 +778,11 @@ Return Value:
         // key.
         //
         
-        IterateKey(NthKey, KeyLength, 1);
+        if (IterateKey(NthKey, KeyLength, 1) != 0) {
+            free(KeyOut);
+            return NULL;
+        }
+        
         for (; Index < KeyLength; ++Index) {
             KeyOut[Index] = NthKey[Index - KeyOffset];
         }
@@ -408,7 +791,7 @@ Return Value:
     return KeyOut;
 }
 
-void
+int
 Encrypt(
     byte * Block,
     size_t BlockLength,
@@ -435,7 +818,7 @@ Parameters:
     
 Return Value:
 
-    None.
+    Returns zero (0) on success, or non-zero on failure.
 
 --*/
 
@@ -449,11 +832,15 @@ Return Value:
         
         if (KeyIndex == KeyLength) {
             KeyIndex = 0;
-            IterateKey(Key, KeyLength, 1);
+            if (IterateKey(Key, KeyLength, 1) != 0) {
+                return 1;
+            }
         }
         
         Block[Index] = Block[Index] ^ Key[KeyIndex];
     }
+    
+    return 0;
 }
 
 //
@@ -474,32 +861,32 @@ WorkerThreadRoutine(
 
     WorkerContext = (WORKER_CONTEXT*)Context;
     Buffer = malloc(WorkerContext->Options->BlockSize);
-    
+
     for (;;) {
     
         //
         // Read a block from the stream.
         //
         
-        Result = ReadBlock(WorkerContext->InputStream,
+        Result = ReadBlock(WorkerContext->IoSyncBlock,
                            Buffer,
                            WorkerContext->Options->BlockSize,
                            &Offset,
                            &BytesRead);
                            
-        if (Result == 2) {
-            fprintf(stderr, "WorkerThreadRoutine barfed\n");
-            exit(2);
-        }
- 
         if (Result == 1) {
             break;
         }
 
-        assert(BytesRead > 0); // rwurdack_todo -- handle this.
+        if (Result != 0) {
+            exit(1);
+        }
+
+        assert(BytesRead > 0);
         
         //
-        // Calculate the key appropriate to this block.
+        // Calculate the key appropriate to the start of this block, then
+        // encrypt the block.
         //
          
         Key = CreateBlockKey(WorkerContext->Key,
@@ -508,19 +895,28 @@ WorkerThreadRoutine(
 
         if (Key == NULL) {
             fprintf(stderr, "Allocation failure in worker thread\n");
-            exit(2);       
+            exit(1);       
         }
         
-        Encrypt(Buffer, BytesRead, Key, WorkerContext->KeyLength);
+        Result = Encrypt(Buffer, BytesRead, Key, WorkerContext->KeyLength);
+        if (Result != 0) {
+            exit(1);
+        }
         
         //
         // Write out the encrypted block.
         //
         
-        Result = WriteBlock(WorkerContext->OutputStream,
+        Result = WriteBlock(WorkerContext->IoSyncBlock,
                             Buffer,
                             BytesRead,
                             Offset);
+
+        if (Result != 0) {
+            exit(1);
+        }
+                            
+        free(Key);
     }
 
     free(Buffer);

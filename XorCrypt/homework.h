@@ -31,9 +31,23 @@ ParseCommandLine(
 // ------------------------------------------------------------------- File I/O
 //
 
+typedef struct _IO_SYNCHRONIZATION_BLOCK {
+
+    FILE * InputStream;
+    pthread_mutex_t ReadLock;
+    size_t ReadOffset;
+    
+    FILE * OutputStream;
+    pthread_mutex_t WriteLock;
+    pthread_cond_t WriteEvent;
+    size_t WriteOffset;
+    
+} IO_SYNCHRONIZATION_BLOCK;
+
+
 int
 ReadBlock(
-    FILE * Stream,
+    IO_SYNCHRONIZATION_BLOCK * IoSyncBlock,
     byte * Buffer,
     size_t BufferLength,
     size_t * Offset,
@@ -42,7 +56,7 @@ ReadBlock(
 
 int
 WriteBlock(
-    FILE * Stream,
+    IO_SYNCHRONIZATION_BLOCK * IoSyncBlock,
     byte * Buffer,
     size_t BufferLength,
     size_t Offset
@@ -59,13 +73,19 @@ ReadKey(
     size_t * KeyLength
     );
 
+int
+IterateKey(
+    byte * Key,
+    size_t KeyLength,
+    int Iteration
+    );
+
 //
 // -------------------------------------------------------------- Worker Thread
 //
 
 typedef struct _WORKER_CONTEXT {
-    FILE * InputStream;
-    FILE * OutputStream;
+    IO_SYNCHRONIZATION_BLOCK * IoSyncBlock;
     OPTIONS const * Options;
     byte const * Key;
     size_t KeyLength;
