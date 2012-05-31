@@ -40,7 +40,7 @@ Description:
       
       * The offsets of a character in P and its encrypted counterpart in E are 
         the same. In the multithreaded implementation below, this allows a 
-        writer to always know to which file position its output needs to be
+        writer to know always to which file position its output needs to be
         written.
         
       * The key material used to encrypt a character at a given offset can
@@ -89,7 +89,7 @@ Description:
 
 Analysis:
 
-    There are tons of obvious improvements to be made with the implementation.
+    There are obvious improvements that can be made with the implementation.
     
     Key iteration requires memory allocations. Calculating the initial key for
     a given block in the stream requires an allocation and one or two key 
@@ -102,7 +102,7 @@ Analysis:
     (|P| - n) bytes could be output, and given the triviality of the encryption
     mechanism, these would be recoverable. Routines in the implementation 
     will attempt to propagate errors out to the worker thread routine, but it
-    would be equally correct to simply abort() or exit() when any error 
+    would be equally reasonable simply to abort() or exit() when any error 
     condition is detected.
     
     Because the encryption scheme is so simple, computation isn't expected to
@@ -117,18 +117,26 @@ Analysis:
     If the input and output streams are on the same spindle of a filesystem,
     it's likely Reads and Writes serialize against one another as well.
     
-    The implementation handles encryption in fixed size chunks. It is likely
-    that tuning these chunks to some ideal size for the given filesystem would
-    affect performance. The current implementation uses a chunk of 64k.
+    It's conceivable that writes could occur out of order. The implementation
+    handles this by blocking out of order writes. This will result in idle CPUs
+    when the number of threads is less than or equal to number of processors.
+    
+    The implementation handles encryption in fixed size blocks. Tuning these 
+    blocks to some ideal size for the given filesystem would likely affect 
+    performance. The current implementation uses a block size of 64k. An
+    implementation that took the block size from the command line would allow
+    one to anyalyze performance for various block sizes.
 
 --*/
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <pthread.h>
 #include <assert.h>
+#include <errno.h>
 
 #include "homework.h"
 
@@ -184,7 +192,12 @@ Return Value:
     //
 
     if (ReadKey(Options.KeyFileName, &Key, &KeyLength) != 0) {
-        exit (1);
+        exit(1);
+    }
+
+    if (KeyLength == 0) {
+        fprintf(stderr, "Keyfile has zero bytes\n");
+        exit(1);
     }
 
 #if defined(REFERENCE_IMPL)
@@ -249,15 +262,18 @@ Return Value:
     if (Options.ThreadCount > 1) {
         WorkerThreads = calloc(Options.ThreadCount - 1, sizeof(pthread_t));
         if (WorkerThreads == NULL) {
-            fprintf(stderr, "Failure allocating thread pool\n");
-            exit(1);
+            error(1, errno, "Failure allocating thread array.\n");
         }
         
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
-            pthread_create(&WorkerThreads[Index],
-                           NULL, 
-                           WorkerThreadRoutine,
-                           &WorkerContext);
+            Result = pthread_create(&WorkerThreads[Index],
+                                    NULL, 
+                                    WorkerThreadRoutine,
+                                    &WorkerContext);
+                                    
+            if (Result != 0) {
+                error(1, Result, "Failed creating thread\n");
+            }
         }
     }
     
@@ -272,10 +288,11 @@ Return Value:
     //
     
     if (Options.ThreadCount > 1) {
-        free(WorkerThreads);
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
             pthread_join(WorkerThreads[Index], NULL);
         }
+        
+        free(WorkerThreads);
     }
 
 #endif
@@ -348,6 +365,7 @@ Return Value:
     if (*BytesRead != BufferLength) {
         if (feof(IoSyncBlock->InputStream)) {
             return 1; // rwurdack_todo - eof
+
         } else {
             err(ferror(IoSyncBlock->InputStream), "Error in ReadBlock.\n");
             return 2; // rwurdack_todo - fatal
@@ -701,11 +719,12 @@ Return Value:
     return 0;
 }
 
-byte *
+int
 CreateBlockKey(
     byte const * Key,
     size_t KeyLength,
-    size_t BlockOffset
+    size_t BlockOffset,
+    byte * NewKey
     )
     
 /*++
@@ -722,12 +741,14 @@ Parameters:
     KeyLength - Supplies the length of the key material.
     
     BlockOffset - Supplies the offset of the block requiring a new key.
+    
+    NewKey - Supplies a pointer to memory that receives the new key. The memory
+        must be at least KeyLength bytes long.
        
 Return Value:
 
-    Returns a newly allocated key on success, or NULL on failure. The new key
-    must be freed with free().
-    
+    Returns 0 on success, non-zero on failure.
+        
 --*/
 
 {
@@ -735,60 +756,63 @@ Return Value:
     int Index;
     int KeyIndex;
     int KeyOffset; 
-    byte * KeyOut;
-    byte * NthKey;
+    byte * WorkingKey;
     int SubIndex;
 
-    KeyOut = malloc(KeyLength * 2);
-    if (KeyOut != NULL) {
-        NthKey = KeyOut + KeyLength;
-        
-        // 
-        // Find the Index of the key that overlaps the beginning of this block.
-        // 
-        
-        KeyIndex = BlockOffset / KeyLength;
+    assert(Key != NULL);
+    assert(KeyLength > 0);
+    assert(NewKey != NULL);
 
-        //
-        // Calculate the Nth key
-        //
-        
-        memcpy(NthKey, Key, KeyLength);
-        if (IterateKey(NthKey, KeyLength, KeyIndex) != 0) {
-            free(KeyOut);
-            return NULL;
-        }
-            
-        // 
-        // Find the offset into the NthKey to start the new key.
-        //
-        
-        KeyOffset = BlockOffset % KeyLength;
-        
-        //
-        // Copy the end bytes of the Nth key to the start of the new key.
-        //
-        
-        for (Index = 0; Index < KeyLength - KeyOffset; ++Index) {
-            KeyOut[Index] = NthKey[Index + KeyOffset];
-        }
-        
-        //
-        // Copy the beginning bytes of the (N+1)the key to the end of the new
-        // key.
-        //
-        
-        if (IterateKey(NthKey, KeyLength, 1) != 0) {
-            free(KeyOut);
-            return NULL;
-        }
-        
-        for (; Index < KeyLength; ++Index) {
-            KeyOut[Index] = NthKey[Index - KeyOffset];
-        }
+    WorkingKey = malloc(KeyLength);
+    if (WorkingKey == NULL) {
+        return 1;
     }
     
-    return KeyOut;
+    // 
+    // Find the Index of the key that overlaps the beginning of this block.
+    // 
+    
+    KeyIndex = BlockOffset / KeyLength;
+
+    //
+    // Calculate the Nth key
+    //
+    
+    memcpy(WorkingKey, Key, KeyLength);
+    if (IterateKey(WorkingKey, KeyLength, KeyIndex) != 0) {
+        free(WorkingKey);
+        return 1;
+    }
+        
+    // 
+    // Find the offset into the NthKey to start the new key.
+    //
+    
+    KeyOffset = BlockOffset % KeyLength;
+    
+    //
+    // Copy the end bytes of the Nth key to the start of the new key.
+    //
+    
+    for (Index = 0; Index < KeyLength - KeyOffset; ++Index) {
+        NewKey[Index] = WorkingKey[Index + KeyOffset];
+    }
+    
+    //
+    // Copy the beginning bytes of the (N+1)the key to the end of the new
+    // key.
+    //
+    
+    if (IterateKey(WorkingKey, KeyLength, 1) != 0) {
+        free(WorkingKey);
+        return 1;
+    }
+    
+    for (; Index < KeyLength; ++Index) {
+        NewKey[Index] = WorkingKey[Index - KeyOffset];
+    }
+    
+    return 0;
 }
 
 int
@@ -854,13 +878,21 @@ WorkerThreadRoutine(
 {
     byte * Buffer;
     size_t BytesRead;
-    byte * Key;
+    byte * BlockKey;
     size_t Offset;
     int Result;
     WORKER_CONTEXT * WorkerContext;
 
     WorkerContext = (WORKER_CONTEXT*)Context;
     Buffer = malloc(WorkerContext->Options->BlockSize);
+    if (Buffer == NULL) {
+        ErrorExit(errno, "Buffer allocation failure in WorkerThreadRoutine\n");
+    }
+    
+    BlockKey = malloc(WorkerContext->KeyLength);
+    if (BlockKey == NULL) {
+        ErrorExit(errno, "Key allocation failure in WorkerThreadRoutine\n");
+    }
 
     for (;;) {
     
@@ -889,16 +921,17 @@ WorkerThreadRoutine(
         // encrypt the block.
         //
          
-        Key = CreateBlockKey(WorkerContext->Key,
-                             WorkerContext->KeyLength,
-                             Offset);
+        Result = CreateBlockKey(WorkerContext->Key,
+                                WorkerContext->KeyLength,
+                                Offset,
+                                BlockKey);
 
-        if (Key == NULL) {
+        if (Result != 0) {
             fprintf(stderr, "Allocation failure in worker thread\n");
             exit(1);       
         }
         
-        Result = Encrypt(Buffer, BytesRead, Key, WorkerContext->KeyLength);
+        Result = Encrypt(Buffer, BytesRead, BlockKey, WorkerContext->KeyLength);
         if (Result != 0) {
             exit(1);
         }
@@ -915,12 +948,65 @@ WorkerThreadRoutine(
         if (Result != 0) {
             exit(1);
         }
-                            
-        free(Key);
     }
 
+    free(BlockKey);
     free(Buffer);
         
     return NULL;
+}
+
+void
+ErrorExit(
+    int ErrorNumber,
+    char const * Format,
+    ...
+    )
+
+/*++
+
+Description:
+
+    This routine formats an error code, prints a formatted message, then exits
+    the process with exit code 1.
+    
+Arguments:
+
+    ErrorNumber - Supplies the error value to format. Usually this will be 
+        errno.
+        
+    Format - Supplies a format string.
+    
+    ... - Supplies arguments for the format string.
+    
+Return Value:
+
+    None. The routine does not return.
+    
+--*/
+
+{
+    va_list Args;
+    char ErrorString[256];
+    
+    va_start(Args, Format);
+    vfprintf(stderr, Format, Args);
+    va_end(Args);
+
+    //
+    // In normal circumstances, ErrorString would be allocated on demand to
+    // accommodate the string returned by strerror_r. Besides being overkill 
+    // for a failur situation, it's likely the caller of this routine is 
+    // handling a low memory condition. Another alloc isn't likely to succeed.
+    //
+    
+    if (strerror_r(ErrorNumber, ErrorString, sizeof(ErrorString)) == 0) {
+        fprintf(stderr, "Aborting: %s\n", ErrorString);
+    
+    } else {
+        fprintf(stderr, "Aborting: ErrorNumber = %d\n", ErrorNumber);
+    }
+    
+    exit(1);
 }
 

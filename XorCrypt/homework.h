@@ -95,4 +95,12 @@ void *
 WorkerThreadRoutine(
     void * Context
     );
+    
+void
+ErrorExit(
+    int ErrorNumber,
+    char const * Format,
+    ...
+    );
+
 
