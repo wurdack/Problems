@@ -66,18 +66,6 @@ Description:
     
     Reads are synchronized by a reader mutex. A read returns the stream data and
     its offset. The current stream offset is updated under the mutex as well.
-
-    Because key material can be easily calculated for any offset in the stream,
-    it is possible to generate a new initial key (with the same length |K|) 
-    for any given block in the stream. This new key can itself be iterated over
-    the block without changing the results of the algorithm.
-    
-    [ Block_0                   ][ Block_1                   ][...
-    [ K_0      ][ K_1      ][ K_2      ][ K_3      ][ K_4      ][ K_5      ][...
-                                 [ K'_0     ][ K'_1     ][ K'_2     ]
-    
-    In the above diagram, K' is comprised of bits of K_2 and K_3, and, once
-    calculated, suffices for encrypting Block_1 independently of all other work.
     
     Writes are synchronized by a writer mutex. A writer must specify the offset
     in the stream to write to. If the current write stream offset matches the
@@ -91,11 +79,8 @@ Analysis:
 
     There are obvious improvements that can be made with the implementation.
     
-    Key iteration requires memory allocations. Calculating the initial key for
-    a given block in the stream requires an allocation and one or two key 
-    iterations. This results in several memory allocations that could be moved
-    up into the main thread routine, or handled more efficiently with a look-
-    aside list (since key length is invariant during the life of the process).
+    Key iteration requires one memory allocations. This allocation could be
+    done up front once rather than for every iteration. 
     
     Error handling is always fatal, as there is no way to gracefully handle an
     error and leave the encrypted stream in a useable state. At best, some
@@ -241,7 +226,7 @@ Return Value:
     IoSyncBlock.ReadOffset = 0;                
     IoSyncBlock.WriteOffset = 0;
     IoSyncBlock.InputStream = stdin;
-    IoSyncBlock.OutputStream = stdout;                
+    IoSyncBlock.OutputStream = stdout;
     pthread_mutex_init(&IoSyncBlock.ReadLock, NULL);
     pthread_mutex_init(&IoSyncBlock.WriteLock, NULL);
     pthread_cond_init(&IoSyncBlock.WriteEvent, NULL);
@@ -262,7 +247,7 @@ Return Value:
     if (Options.ThreadCount > 1) {
         WorkerThreads = calloc(Options.ThreadCount - 1, sizeof(pthread_t));
         if (WorkerThreads == NULL) {
-            error(1, errno, "Failure allocating thread array.\n");
+            ErrorExit(errno, "Failure allocating thread array.\n");
         }
         
         for (Index = 0; Index < Options.ThreadCount - 1; ++Index) {
@@ -272,7 +257,7 @@ Return Value:
                                     &WorkerContext);
                                     
             if (Result != 0) {
-                error(1, Result, "Failed creating thread\n");
+                ErrorExit(Result, "Failed creating thread\n");
             }
         }
     }
@@ -348,7 +333,8 @@ Arguments:
 
 Return Value:
 
-    The routine returns 0 on success, 1 if EOF is reached, and 2 on fatal error.
+    The routine returns 0 on success, or non-zero if there was an error reading
+    the input stream.
     
 --*/
 
@@ -362,16 +348,11 @@ Return Value:
 
     pthread_mutex_unlock(&IoSyncBlock->ReadLock);
     
-    if (*BytesRead != BufferLength) {
-        if (feof(IoSyncBlock->InputStream)) {
-            return 1; // rwurdack_todo - eof
+    if ((*BytesRead != BufferLength) && ferror(IoSyncBlock->InputStream)) {
+        return 1;
 
-        } else {
-            err(ferror(IoSyncBlock->InputStream), "Error in ReadBlock.\n");
-            return 2; // rwurdack_todo - fatal
-        }
     } else {
-        return 0; // rwurdack_todo - ok
+        return 0;
     }
 }
 
@@ -720,105 +701,10 @@ Return Value:
 }
 
 int
-CreateBlockKey(
-    byte const * Key,
-    size_t KeyLength,
-    size_t BlockOffset,
-    byte * NewKey
-    )
-    
-/*++
-
-Description:
-
-    This routine calculates an appropriate initial key for a given file
-    offset.
-    
-Parameters:
-
-    Key - Supplies a pointer the key material.
-    
-    KeyLength - Supplies the length of the key material.
-    
-    BlockOffset - Supplies the offset of the block requiring a new key.
-    
-    NewKey - Supplies a pointer to memory that receives the new key. The memory
-        must be at least KeyLength bytes long.
-       
-Return Value:
-
-    Returns 0 on success, non-zero on failure.
-        
---*/
-
-{
-
-    int Index;
-    int KeyIndex;
-    int KeyOffset; 
-    byte * WorkingKey;
-    int SubIndex;
-
-    assert(Key != NULL);
-    assert(KeyLength > 0);
-    assert(NewKey != NULL);
-
-    WorkingKey = malloc(KeyLength);
-    if (WorkingKey == NULL) {
-        return 1;
-    }
-    
-    // 
-    // Find the Index of the key that overlaps the beginning of this block.
-    // 
-    
-    KeyIndex = BlockOffset / KeyLength;
-
-    //
-    // Calculate the Nth key
-    //
-    
-    memcpy(WorkingKey, Key, KeyLength);
-    if (IterateKey(WorkingKey, KeyLength, KeyIndex) != 0) {
-        free(WorkingKey);
-        return 1;
-    }
-        
-    // 
-    // Find the offset into the NthKey to start the new key.
-    //
-    
-    KeyOffset = BlockOffset % KeyLength;
-    
-    //
-    // Copy the end bytes of the Nth key to the start of the new key.
-    //
-    
-    for (Index = 0; Index < KeyLength - KeyOffset; ++Index) {
-        NewKey[Index] = WorkingKey[Index + KeyOffset];
-    }
-    
-    //
-    // Copy the beginning bytes of the (N+1)the key to the end of the new
-    // key.
-    //
-    
-    if (IterateKey(WorkingKey, KeyLength, 1) != 0) {
-        free(WorkingKey);
-        return 1;
-    }
-    
-    for (; Index < KeyLength; ++Index) {
-        NewKey[Index] = WorkingKey[Index - KeyOffset];
-    }
-    
-    return 0;
-}
-
-int
 Encrypt(
     byte * Block,
     size_t BlockLength,
+    size_t BlockOffset,
     byte * Key,
     size_t KeyLength
     )
@@ -835,6 +721,8 @@ Parameters:
     
     BlockLength - Supplies the length of the block of memory.
     
+    BlockOffset - Offset of the block in the original stream.
+    
     Key - Supplies the key material with which the block is encrypted. The key
         material is destroyed by this operation.
         
@@ -849,8 +737,26 @@ Return Value:
 {
     int Index;
     int KeyIndex;
+
+    //
+    // Calculate the first key to overlap the start of this block.
+    //
     
-    for (KeyIndex = 0, Index = 0;
+    if (IterateKey(Key, KeyLength, BlockOffset / KeyLength) != 0) {
+        return 1;
+    }
+    
+    //
+    // Calculate the offset into the key.
+    //
+    
+    KeyIndex = BlockOffset % KeyLength;
+
+    //
+    // Encrypt
+    //
+    
+    for (Index = 0;
          Index < BlockLength; 
          ++Index, ++KeyIndex) {
         
@@ -893,7 +799,7 @@ WorkerThreadRoutine(
     if (BlockKey == NULL) {
         ErrorExit(errno, "Key allocation failure in WorkerThreadRoutine\n");
     }
-
+    
     for (;;) {
     
         //
@@ -906,47 +812,43 @@ WorkerThreadRoutine(
                            &Offset,
                            &BytesRead);
                            
-        if (Result == 1) {
+        if (Result != 0) {
+            ErrorExit(ferror(WorkerContext->IoSyncBlock->InputStream),
+                      "An error occured while reading the input stream\n");
+        }
+
+        if (BytesRead > 0) {
+            memcpy(BlockKey, WorkerContext->Key, WorkerContext->KeyLength);
+            Result = Encrypt(Buffer, 
+                             BytesRead, 
+                             Offset,
+                             BlockKey, 
+                             WorkerContext->KeyLength);
+                             
+            if (Result != 0) {
+                exit(1);
+            }
+            
+            //
+            // Write out the encrypted block.
+            //
+            
+            Result = WriteBlock(WorkerContext->IoSyncBlock,
+                                Buffer,
+                                BytesRead,
+                                Offset);
+
+            if (Result != 0) {
+                exit(1);
+            }
+        }
+
+        //
+        // Work is complete when EOF is reached.
+        //
+        
+        if (feof(WorkerContext->IoSyncBlock->InputStream)) {
             break;
-        }
-
-        if (Result != 0) {
-            exit(1);
-        }
-
-        assert(BytesRead > 0);
-        
-        //
-        // Calculate the key appropriate to the start of this block, then
-        // encrypt the block.
-        //
-         
-        Result = CreateBlockKey(WorkerContext->Key,
-                                WorkerContext->KeyLength,
-                                Offset,
-                                BlockKey);
-
-        if (Result != 0) {
-            fprintf(stderr, "Allocation failure in worker thread\n");
-            exit(1);       
-        }
-        
-        Result = Encrypt(Buffer, BytesRead, BlockKey, WorkerContext->KeyLength);
-        if (Result != 0) {
-            exit(1);
-        }
-        
-        //
-        // Write out the encrypted block.
-        //
-        
-        Result = WriteBlock(WorkerContext->IoSyncBlock,
-                            Buffer,
-                            BytesRead,
-                            Offset);
-
-        if (Result != 0) {
-            exit(1);
         }
     }
 
@@ -996,7 +898,7 @@ Return Value:
     //
     // In normal circumstances, ErrorString would be allocated on demand to
     // accommodate the string returned by strerror_r. Besides being overkill 
-    // for a failur situation, it's likely the caller of this routine is 
+    // for a failure situation, it's likely the caller of this routine is 
     // handling a low memory condition. Another alloc isn't likely to succeed.
     //
     

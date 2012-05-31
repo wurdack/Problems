@@ -25,7 +25,7 @@ ParseCommandLine(
 // Some options are currently compile time constants.
 //
 
-#define DEFAULT_BLOCKSIZE 65536
+#define DEFAULT_BLOCKSIZE 128
 
 //
 // ------------------------------------------------------------------- File I/O

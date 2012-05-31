@@ -83,10 +83,11 @@ TestIterateKey(
                       sizeof(RandomishKey)) == 0);
     }
     
-    printf("Done.\n");
+    printf("TestIterateKey finished.\n");
 }
 
 main(int argc, char* argv[])
 {
     TestIterateKey();
+    printf("Done.\n");
 }
