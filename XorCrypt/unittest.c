@@ -21,13 +21,13 @@ TestIterateKey(
 {
     byte WorkingKey[128];
     int Index;
-    
+
     printf("Test IterateKey\n");
-    
+
     //
     // Iterating null key shouldn't do anything.
     //
-    
+
     for (Index = 0; Index < 20; ++Index) {
         printf("NullKey ROL %d\n", Index);
         memcpy(WorkingKey, NullKey, sizeof(NullKey));
@@ -38,7 +38,7 @@ TestIterateKey(
     //
     // Iterating Black and White keys should do something.
     //
-    
+
     memcpy(WorkingKey, BlackWhiteKey, sizeof(BlackWhiteKey));
     printf("BlackWhiteKey ROL 8\n");
     IterateKey(WorkingKey, sizeof(BlackWhiteKey), 8);
@@ -48,13 +48,13 @@ TestIterateKey(
     IterateKey(WorkingKey, sizeof(BlackWhiteKey), 7);
     assert(WorkingKey[0] == 0x7f);
     assert(WorkingKey[1] == 0x80);
-    
+
     //
-    // Iterating a grey key an even number of times should get you the same 
+    // Iterating a grey key an even number of times should get you the same
     // grey key. Iterating it an odd number of times should get you the other
     // grey key.
     //
-    
+
     for (Index = 0; Index < 20; ++Index) {
         printf("GreyKey ROL %d\n", Index);
         memcpy(WorkingKey, GreyKey, sizeof(GreyKey));
@@ -64,30 +64,31 @@ TestIterateKey(
 
         } else {
             assert(memcmp(WorkingKey, GreyKey, sizeof(GreyKey)) == 0);
-        }        
+        }
     }
- 
+
     //
     // ROL a random(ish) key every possible amount.
     //
-    
+
     memcpy(WorkingKey, RandomishKey, sizeof(RandomishKey));
     for (Index = 0; Index < sizeof(RandomishKey) * 8; ++Index) {
         printf("RandomishKey ROL %d\n", Index);
         IterateKey(WorkingKey, sizeof(RandomishKey), Index);
-        IterateKey(WorkingKey, 
+        IterateKey(WorkingKey,
                    sizeof(RandomishKey),
                    (sizeof(RandomishKey) * 8) - Index);
-        assert(memcmp(WorkingKey, 
+        assert(memcmp(WorkingKey,
                       RandomishKey,
                       sizeof(RandomishKey)) == 0);
     }
-    
+
     printf("TestIterateKey finished.\n");
 }
 
-main(int argc, char* argv[])
+int main(int argc, char* argv[])
 {
     TestIterateKey();
     printf("Done.\n");
+    return 0;
 }
