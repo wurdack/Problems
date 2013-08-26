@@ -7,4 +7,6 @@ int main(void)
 {
     printf("hello\n");
     rb = rb_create();
+
+    rb_destroy(rb);
 }
