@@ -1,5 +1,5 @@
 __author__ = 'rwurdack'
 
-import simpledb
+import dynamodb
 
-simpledb.run()
+dynamodb.run()
