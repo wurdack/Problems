@@ -1,5 +1,5 @@
 __author__ = 'rwurdack'
 
-import dynamodb
+import sns_test
 
-dynamodb.run()
+sns_test.run()
